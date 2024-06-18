@@ -2,12 +2,15 @@ package ringbuf
 
 import (
 	"errors"
+	"golang.org/x/sys/cpu"
 	"runtime"
 	"sync/atomic"
+	"unsafe"
 )
 
 const (
-	Disposed uint64 = 1
+	CacheLinePadSize        = unsafe.Sizeof(cpu.CacheLinePad{})
+	Disposed         uint64 = 1
 )
 
 var (
@@ -44,13 +47,13 @@ type nodes []node
 // described here: http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
 // with some minor additions.
 type RingBuffer struct {
-	_padding0 [8]uint64
+	_padding0 [CacheLinePadSize - 8]byte
 	queue     uint64
-	_padding1 [8]uint64
+	_padding1 [CacheLinePadSize - 8]byte
 	dequeue   uint64
-	_padding2 [8]uint64
+	_padding2 [CacheLinePadSize - 8]byte
 	closed    uint64
-	_padding3 [8]uint64
+	_padding3 [CacheLinePadSize - 8]byte
 	mask      uint64
 	nodes     nodes
 }
@@ -74,7 +77,7 @@ func (rb *RingBuffer) Put(item interface{}) error {
 
 	for {
 		// * Check if buffer is closed
-		if atomic.LoadUint64(&rb.closed) == 1 {
+		if rb.IsClosed() {
 			return ErrClosed
 		}
 		// * Check if buffer is full
@@ -107,7 +110,7 @@ func (rb *RingBuffer) Get() (interface{}, error) {
 
 	for {
 		// * Check if buffer is closed
-		if atomic.LoadUint64(&rb.closed) == 1 {
+		if rb.IsClosed() {
 			return nil, ErrClosed
 		}
 
