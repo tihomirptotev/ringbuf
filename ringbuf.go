@@ -2,15 +2,12 @@ package ringbuf
 
 import (
 	"errors"
-	"golang.org/x/sys/cpu"
 	"runtime"
 	"sync/atomic"
-	"unsafe"
 )
 
 const (
-	CacheLinePadSize        = unsafe.Sizeof(cpu.CacheLinePad{})
-	Disposed         uint64 = 1
+	Disposed uint64 = 1
 )
 
 var (
@@ -40,26 +37,22 @@ type node struct {
 
 type nodes []node
 
-// RingBuffer is a MPMC buffer that achieves threadsafety with CAS operations
-// only.  A put on full or get on empty call will block until an item
-// is put or retrieved.  Calling Dispose on the RingBuffer will unblock
-// any blocked threads with an error.  This buffer is similar to the buffer
-// described here: http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
-// with some minor additions.
+// RingBuffer is a MPMC buffer that achieves thread safety with CAS operations
+// only. A put on full or get on empty call will return error. Calling Close on the RingBuffer will unblock
+// any blocked goroutines with an error. The code in this buffer has been adapted from the original code found at
+// https://github.com/Workiva/go-datastructures/queue/ring.go.
 type RingBuffer struct {
-	_padding0 [CacheLinePadSize - 8]byte
 	queue     uint64
-	_padding1 [CacheLinePadSize - 8]byte
+	_padding1 [56]byte
 	dequeue   uint64
-	_padding2 [CacheLinePadSize - 8]byte
-	closed    uint64
-	_padding3 [CacheLinePadSize - 8]byte
+	_padding2 [56]byte
 	mask      uint64
+	_padding3 [56]byte
+	closed    uint64
+	_padding4 [56]byte
 	nodes     nodes
 }
 
-// NewRingBuffer will allocate, initialize, and return a ring buffer
-// with the specified size.
 func NewRingBuffer(size uint64) *RingBuffer {
 	size = roundUp(size)
 	rb := &RingBuffer{
@@ -74,14 +67,16 @@ func NewRingBuffer(size uint64) *RingBuffer {
 
 func (rb *RingBuffer) Put(item interface{}) error {
 	var n *node
+	q := atomic.LoadUint64(&rb.queue)
 
+Loop:
 	for {
 		// * Check if buffer is closed
-		if rb.IsClosed() {
+		if atomic.LoadUint64(&rb.closed) == Disposed {
 			return ErrClosed
 		}
+
 		// * Check if buffer is full
-		q := atomic.LoadUint64(&rb.queue)
 		deq := atomic.LoadUint64(&rb.dequeue)
 		if (q+1)&rb.mask == deq&rb.mask {
 			return ErrFull
@@ -92,9 +87,7 @@ func (rb *RingBuffer) Put(item interface{}) error {
 		switch dif := seq - q; {
 		case dif == 0:
 			if atomic.CompareAndSwapUint64(&rb.queue, q, q+1) {
-				n.data = item
-				atomic.StoreUint64(&n.position, q+1)
-				return nil
+				break Loop
 			}
 		case dif < 0:
 			panic(`Ring buffer in a compromised state during a put operation.`)
@@ -103,20 +96,24 @@ func (rb *RingBuffer) Put(item interface{}) error {
 		}
 		runtime.Gosched()
 	}
+
+	n.data = item
+	atomic.StoreUint64(&n.position, q+1)
+	return nil
 }
 
 func (rb *RingBuffer) Get() (interface{}, error) {
 	var n *node
-
+	deq := atomic.LoadUint64(&rb.dequeue)
+Loop:
 	for {
 		// * Check if buffer is closed
-		if rb.IsClosed() {
+		if atomic.LoadUint64(&rb.closed) == Disposed {
 			return nil, ErrClosed
 		}
 
 		// * Check if buffer is empty
 		q := atomic.LoadUint64(&rb.queue)
-		deq := atomic.LoadUint64(&rb.dequeue)
 		if q&rb.mask == deq&rb.mask {
 			return nil, ErrEmpty
 		}
@@ -126,10 +123,7 @@ func (rb *RingBuffer) Get() (interface{}, error) {
 		switch dif := seq - (deq + 1); {
 		case dif == 0:
 			if atomic.CompareAndSwapUint64(&rb.dequeue, deq, deq+1) {
-				data := n.data
-				n.data = nil
-				atomic.StoreUint64(&n.position, deq+rb.mask+1)
-				return data, nil
+				break Loop
 			}
 		case dif < 0:
 			panic(`Ring buffer in compromised state during a get operation.`)
@@ -138,11 +132,12 @@ func (rb *RingBuffer) Get() (interface{}, error) {
 		}
 		runtime.Gosched()
 	}
-}
 
-//func (rb *RingBuffer) Len() uint64 {
-//	return atomic.LoadUint64(&rb.queue) - atomic.LoadUint64(&rb.dequeue)
-//}
+	data := n.data
+	n.data = nil
+	atomic.StoreUint64(&n.position, deq+rb.mask+1)
+	return data, nil
+}
 
 func (rb *RingBuffer) IsEmpty() bool {
 	q := atomic.LoadUint64(&rb.queue)
@@ -169,7 +164,6 @@ func (rb *RingBuffer) Len() uint64 {
 	return 0
 }
 
-// Cap returns the capacity of this ring buffer.
 func (rb *RingBuffer) Cap() uint64 {
 	return uint64(len(rb.nodes))
 }

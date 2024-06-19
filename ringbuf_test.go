@@ -3,9 +3,11 @@ package ringbuf
 import (
 	"github.com/stretchr/testify/assert"
 	"testing"
+	"unsafe"
 )
 
 func TestRingBuffer_IsEmpty(t *testing.T) {
+	t.Log(unsafe.Sizeof(node{}))
 	tests := []struct {
 		name     string
 		setup    func(*RingBuffer)
