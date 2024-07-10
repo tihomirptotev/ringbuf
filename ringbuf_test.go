@@ -1,8 +1,13 @@
 package ringbuf
 
 import (
+	"errors"
+	"github.com/Workiva/go-datastructures/queue"
 	"github.com/stretchr/testify/assert"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -188,5 +193,444 @@ func TestRingBuffer_Size(t *testing.T) {
 				t.Errorf("unexpected size. want: %v, got: %v", tt.expectedLen, size)
 			}
 		})
+	}
+}
+
+// Adapted tests from workiva ring buffer
+func TestPut(t *testing.T) {
+
+	t.Run("single put", func(t *testing.T) {
+		rb := NewRingBuffer(5)
+		assert.Equal(t, uint64(8), rb.Cap())
+
+		err := rb.Put(5)
+		assert.NoError(t, err)
+
+		result, err := rb.Get()
+		assert.NoError(t, err)
+		assert.Equal(t, 5, result)
+	})
+
+	t.Run("multiple put", func(t *testing.T) {
+		rb := NewRingBuffer(5)
+		assert.Equal(t, uint64(8), rb.Cap())
+
+		err := rb.Put(1)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(1), rb.Len())
+
+		err = rb.Put(2)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(2), rb.Len())
+
+		result, err := rb.Get()
+		assert.NoError(t, err)
+		assert.Equal(t, 1, result)
+		assert.Equal(t, uint64(1), rb.Len())
+
+		result, err = rb.Get()
+		assert.NoError(t, err)
+		assert.Equal(t, 2, result)
+		assert.Equal(t, uint64(0), rb.Len())
+	})
+
+	t.Run("buffer full", func(t *testing.T) {
+		rb := NewRingBuffer(5)
+		assert.Equal(t, uint64(8), rb.Cap())
+
+		for i := range rb.Cap() - 1 {
+			err := rb.Put(i)
+			assert.NoError(t, err)
+			assert.Equal(t, uint64(i+1), rb.Len())
+		}
+
+		err := rb.Put(7)
+		assert.ErrorIs(t, err, ErrFull)
+	})
+
+	t.Run("try to put", func(t *testing.T) {
+		rb := NewRingBuffer(2)
+		assert.Equal(t, uint64(2), rb.Cap())
+
+		err := rb.Put("foo")
+		assert.NoError(t, err)
+
+		err = rb.Put("bar")
+		assert.ErrorIs(t, err, ErrFull)
+
+		item, err := rb.Get()
+		assert.NoError(t, err)
+		assert.Equal(t, "foo", item)
+
+		assert.Equal(t, uint64(0), rb.Len())
+		assert.Equal(t, uint64(2), rb.Cap())
+
+		rb.Close()
+		assert.Equal(t, true, rb.IsClosed())
+
+		err = rb.Put("foo")
+		assert.ErrorIs(t, err, ErrClosed)
+
+		_, err = rb.Get()
+		assert.ErrorIs(t, err, ErrClosed)
+	})
+
+}
+
+func TestIntertwinedGetAndPut(t *testing.T) {
+	rb := NewRingBuffer(5)
+	err := rb.Put(1)
+	assert.NoError(t, err)
+
+	result, err := rb.Get()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, result)
+
+	err = rb.Put(2)
+	assert.NoError(t, err)
+
+	result, err = rb.Get()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, result)
+}
+
+func TestPutToFull(t *testing.T) {
+	rb := NewRingBuffer(5)
+
+	for i := range int(rb.Cap() - 1) {
+		err := rb.Put(i)
+		assert.NoError(t, err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		err := rb.Put(7)
+		assert.ErrorIs(t, err, ErrFull)
+
+		time.Sleep(time.Millisecond * 2)
+
+		err = rb.Put(7)
+		assert.NoError(t, err)
+		wg.Done()
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(time.Millisecond)
+		result, err := rb.Get()
+		assert.NoError(t, err)
+		assert.Equal(t, 0, result)
+	}()
+
+	wg.Wait()
+}
+
+func TestGet(t *testing.T) {
+	t.Run("empty buffer", func(t *testing.T) {
+		rb := NewRingBuffer(5)
+		_, err := rb.Get()
+		assert.ErrorIs(t, err, ErrEmpty)
+	})
+
+}
+
+func TestLen(t *testing.T) {
+	rb := NewRingBuffer(4)
+	assert.Equal(t, uint64(0), rb.Len())
+	assert.Equal(t, uint64(4), rb.Cap())
+
+	err := rb.Put(1)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(1), rb.Len())
+
+	_, err = rb.Get()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(0), rb.Len())
+
+	for i := 0; i < int(rb.Cap()-1); i++ {
+		err = rb.Put(i)
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, uint64(3), rb.Len())
+
+	_, err = rb.Get()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(2), rb.Len())
+}
+
+func TestClose(t *testing.T) {
+
+	t.Run("on get", func(t *testing.T) {
+		numThreads := 8
+		var wg sync.WaitGroup
+		wg.Add(numThreads)
+		rb := NewRingBuffer(4)
+		var spunUp sync.WaitGroup
+		spunUp.Add(numThreads)
+
+		for i := 0; i < numThreads; i++ {
+			go func() {
+				spunUp.Done()
+				defer wg.Done()
+				_, err := rb.Get()
+				assert.NotNil(t, err)
+			}()
+		}
+
+		spunUp.Wait()
+		rb.Close()
+
+		wg.Wait()
+		assert.True(t, rb.IsClosed())
+	})
+
+	t.Run("on put", func(t *testing.T) {
+		numThreads := 8
+		var wg sync.WaitGroup
+		wg.Add(numThreads)
+		rb := NewRingBuffer(4)
+		var spunUp sync.WaitGroup
+		spunUp.Add(numThreads)
+
+		// fill up the queue
+		for i := 0; i < 3; i++ {
+			err := rb.Put(i)
+			assert.NoError(t, err)
+		}
+
+		// it's now full
+		for i := 0; i < numThreads; i++ {
+			go func(i int) {
+				spunUp.Done()
+				defer wg.Done()
+				err := rb.Put(i)
+				assert.NotNil(t, err)
+			}(i)
+		}
+
+		spunUp.Wait()
+
+		rb.Close()
+
+		wg.Wait()
+
+		assert.True(t, rb.IsClosed())
+	})
+
+}
+
+func BenchmarkLifeCycle(b *testing.B) {
+	rb := NewRingBuffer(1024)
+
+	counter := uint64(0)
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		for {
+			_, err := rb.Get()
+			if err != nil {
+				assert.ErrorIs(b, err, ErrEmpty)
+				continue
+			}
+
+			if atomic.AddUint64(&counter, 1) == uint64(b.N) {
+				return
+			}
+		}
+	}()
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; {
+		err := rb.Put(i)
+		if err != nil {
+			assert.ErrorIs(b, err, ErrFull)
+		} else {
+			i++
+		}
+	}
+
+	wg.Wait()
+}
+
+func BenchmarkWorkivaRingBufferLifeCycle(b *testing.B) {
+	rb := queue.NewRingBuffer(1024)
+
+	counter := uint64(0)
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		for {
+			_, err := rb.Get()
+			assert.NoError(b, err)
+
+			if atomic.AddUint64(&counter, 1) == uint64(b.N) {
+				return
+			}
+		}
+	}()
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		err := rb.Put(i)
+		assert.NoError(b, err)
+	}
+
+	wg.Wait()
+}
+
+//goland:noinspection t
+func BenchmarkLifeCycleContention(b *testing.B) {
+	rb := NewRingBuffer(64)
+
+	var wwg sync.WaitGroup
+	var rwg sync.WaitGroup
+	wwg.Add(10)
+	rwg.Add(10)
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			for {
+				_, err := rb.Get()
+				if err != nil {
+					if errors.Is(err, ErrClosed) {
+						rwg.Done()
+						return
+					}
+					assert.ErrorIs(b, err, ErrEmpty)
+				}
+			}
+		}()
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wwg.Done()
+			for j := 0; j < b.N; j++ {
+				err := rb.Put(j)
+				if err != nil {
+					if errors.Is(err, ErrClosed) {
+						return
+					}
+					assert.ErrorIs(b, err, ErrFull)
+				}
+			}
+		}()
+	}
+
+	wwg.Wait()
+	rb.Close()
+	rwg.Wait()
+}
+
+func BenchmarkWorkivaRingBufferLifeCycleContention(b *testing.B) {
+	rb := queue.NewRingBuffer(64)
+
+	var wwg sync.WaitGroup
+	var rwg sync.WaitGroup
+	wwg.Add(10)
+	rwg.Add(10)
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			for {
+				_, err := rb.Get()
+				if errors.Is(err, queue.ErrDisposed) {
+					rwg.Done()
+					return
+				} else {
+					assert.Nil(b, err)
+				}
+			}
+		}()
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			for j := 0; j < b.N; j++ {
+				err := rb.Put(j)
+				assert.NoError(b, err)
+			}
+			wwg.Done()
+		}()
+	}
+
+	wwg.Wait()
+	rb.Dispose()
+	rwg.Wait()
+}
+
+func BenchmarkPut(b *testing.B) {
+	rb := NewRingBuffer(uint64(b.N))
+	var err error
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N-1; i++ {
+		err = rb.Put(i)
+		assert.NoError(b, err)
+	}
+}
+
+func BenchmarkWorkivaRingBufferPut(b *testing.B) {
+	rb := queue.NewRingBuffer(uint64(b.N))
+	var err error
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N-1; i++ {
+		err = rb.Put(i)
+		assert.NoError(b, err)
+	}
+}
+
+func BenchmarkGet(b *testing.B) {
+	rb := NewRingBuffer(uint64(b.N))
+	var err error
+
+	for i := 0; i < b.N-1; i++ {
+		err = rb.Put(i)
+		assert.NoError(b, err)
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N-1; i++ {
+		_, err = rb.Get()
+		assert.NoError(b, err)
+	}
+}
+
+func BenchmarkWorkivaRingBufferGet(b *testing.B) {
+	rb := queue.NewRingBuffer(uint64(b.N))
+	var err error
+
+	for i := 0; i < b.N-1; i++ {
+		err = rb.Put(i)
+		assert.NoError(b, err)
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N-1; i++ {
+		_, err = rb.Get()
+		assert.NoError(b, err)
+	}
+}
+
+func BenchmarkAllocation(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		NewRingBuffer(1024)
 	}
 }
